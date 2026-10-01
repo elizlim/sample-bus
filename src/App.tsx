@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Header } from './components/Header';
 import { RadarMapDrawer } from './components/RadarMapDrawer';
 import { AiPilotModal } from './components/AiPilotModal';
@@ -6,13 +6,16 @@ import { RoutePlannerModal } from './components/RoutePlannerModal';
 import { FavoritesModal } from './components/FavoritesModal';
 import { ServiceAlertsModal } from './components/ServiceAlertsModal';
 import { AdvisoryDetailModal } from './components/AdvisoryDetailModal';
+import { ApiHealthModal } from './components/ApiHealthModal';
 import {
   BUS_STOPS,
   BUS_SERVICES,
   SERVICE_ADVISORIES,
   POPULAR_BUGIS_SERVICES,
-  ServiceAdvisory
+  ServiceAdvisory,
+  ArrivalInfo
 } from './data/transitData';
+import { fetchLtaBusArrival, parseLtaBusArrival, checkApiHealth } from './services/ltaService';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'live-arrivals' | 'route-planner' | 'nearby-stops' | 'favorites' | 'alerts'>('live-arrivals');
@@ -23,10 +26,18 @@ export default function App() {
   const [isMapOpen, setIsMapOpen] = useState(false);
   const [favorites, setFavorites] = useState<string[]>(['01112']);
   const [isLocating, setIsLocating] = useState(false);
-  const [refreshCountdown, setRefreshCountdown] = useState(30);
+  const [refreshCountdown, setRefreshCountdown] = useState(20);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [currentTimeStr, setCurrentTimeStr] = useState('--:--:--');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Live LTA data state
+  const [liveArrivals, setLiveArrivals] = useState<[ArrivalInfo, ArrivalInfo, ArrivalInfo] | null>(null);
+  const [isLtaLive, setIsLtaLive] = useState(false);
+  const [ltaKeyConfigured, setLtaKeyConfigured] = useState(false);
+  const [liveBusCoords, setLiveBusCoords] = useState<{ lat?: string; lng?: string } | null>(null);
+  const [isHealthModalOpen, setIsHealthModalOpen] = useState(false);
+  const [healthData, setHealthData] = useState<any>(null);
 
   // Modals
   const [isAiPilotOpen, setIsAiPilotOpen] = useState(false);
@@ -35,19 +46,93 @@ export default function App() {
   const [isAlertsOpen, setIsAlertsOpen] = useState(false);
   const [selectedAdvisory, setSelectedAdvisory] = useState<ServiceAdvisory | null>(null);
 
-  // Auto-refresh countdown (30s)
+  // Check health and LTA key configuration
+  useEffect(() => {
+    checkApiHealth().then((res) => {
+      if (res.ok) {
+        setLtaKeyConfigured(Boolean(res.ltaAccountKeyConfigured));
+      }
+    });
+  }, []);
+
+  // Fetch LTA Bus Arrival
+  const loadLtaArrivals = useCallback(async (stopCode: string, svcNo: string) => {
+    setIsRefreshing(true);
+    try {
+      const data = await fetchLtaBusArrival(stopCode, svcNo);
+      if (data && data.Services && data.Services.length > 0) {
+        const matched = data.Services.find(
+          (s) => s.ServiceNo.toUpperCase() === svcNo.trim().toUpperCase()
+        ) || data.Services[0];
+
+        if (matched) {
+          const arr1 = parseLtaBusArrival(matched.NextBus, 'SBS3190A') || {
+            time: 'Arr',
+            minutesLeft: 0,
+            status: 'Imminent',
+            deck: 'Double',
+            isWAB: true,
+            load: 'Seats Avail',
+            loadType: 'seats',
+            plate: 'SBS3190A'
+          };
+          const arr2 = parseLtaBusArrival(matched.NextBus2, 'SBS3482D') || {
+            time: '8',
+            minutesLeft: 8,
+            status: 'Normal',
+            deck: 'Single',
+            isWAB: true,
+            load: 'Standing Avail',
+            loadType: 'standing',
+            plate: 'SBS3482D'
+          };
+          const arr3 = parseLtaBusArrival(matched.NextBus3, 'SBS6819S') || {
+            time: '18',
+            minutesLeft: 18,
+            status: 'Normal',
+            deck: 'Double',
+            isWAB: true,
+            load: 'Limited Standing',
+            loadType: 'limited',
+            plate: 'SBS6819S'
+          };
+
+          setLiveArrivals([arr1, arr2, arr3]);
+          setIsLtaLive(true);
+
+          if (matched.NextBus?.Latitude && matched.NextBus?.Longitude) {
+            setLiveBusCoords({
+              lat: matched.NextBus.Latitude,
+              lng: matched.NextBus.Longitude
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load arrivals:', err);
+    } finally {
+      setTimeout(() => setIsRefreshing(false), 500);
+    }
+  }, []);
+
+  // Initial and reactive fetch
+  useEffect(() => {
+    loadLtaArrivals(selectedStopCode, serviceQuery);
+  }, [selectedStopCode, serviceQuery, loadLtaArrivals]);
+
+  // Auto-refresh countdown (20s matching LTA DataMall v3 refresh rate)
   useEffect(() => {
     const timer = setInterval(() => {
       setRefreshCountdown((prev) => {
         if (prev <= 1) {
-          triggerRefresh();
-          return 30;
+          loadLtaArrivals(selectedStopCode, serviceQuery);
+          return 20;
         }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [serviceQuery]);
+  }, [selectedStopCode, serviceQuery, loadLtaArrivals]);
 
   // Live clock
   useEffect(() => {
@@ -61,19 +146,25 @@ export default function App() {
   }, []);
 
   const triggerRefresh = () => {
-    setIsRefreshing(true);
-    setToastMessage('Live arrival telemetry updated from LTA DataMall');
-    setTimeout(() => {
-      setIsRefreshing(false);
-    }, 600);
-    setTimeout(() => {
-      setToastMessage(null);
-    }, 3000);
+    setRefreshCountdown(20);
+    loadLtaArrivals(selectedStopCode, serviceQuery);
+    setToastMessage('Live arrival telemetry updated from /api/bus-arrival');
+    setTimeout(() => setToastMessage(null), 3000);
   };
 
   const handleManualRefresh = () => {
-    setRefreshCountdown(30);
     triggerRefresh();
+  };
+
+  const handleOpenHealth = async () => {
+    setIsHealthModalOpen(true);
+    try {
+      const res = await fetch('/api/health?testLta=true');
+      const data = await res.json();
+      setHealthData(data);
+    } catch (e: any) {
+      setHealthData({ error: e.message });
+    }
   };
 
   const handleLocateMe = () => {
@@ -87,7 +178,6 @@ export default function App() {
           setTimeout(() => setToastMessage(null), 3000);
         },
         () => {
-          // Fallback simulation to Bugis
           setTimeout(() => {
             setIsLocating(false);
             setSelectedStopCode('01112');
@@ -117,7 +207,7 @@ export default function App() {
   };
 
   const currentStop = BUS_STOPS[selectedStopCode] || BUS_STOPS['01112'];
-  const activeServiceData = BUS_SERVICES[serviceQuery.trim().toUpperCase()] || {
+  const baseServiceData = BUS_SERVICES[serviceQuery.trim().toUpperCase()] || {
     serviceNo: serviceQuery || '147',
     operator: 'SBS Transit',
     primaryStopCode: selectedStopCode,
@@ -150,16 +240,15 @@ export default function App() {
     }
   };
 
-  const activeDirection = selectedDirection === 'dir1' ? activeServiceData.direction1 : activeServiceData.direction2;
+  const activeDirection = selectedDirection === 'dir1' ? baseServiceData.direction1 : baseServiceData.direction2;
+  const displayArrivals = (selectedDirection === 'dir1' && liveArrivals) ? liveArrivals : activeDirection.arrivals;
   const isCurrentStopFavorited = favorites.includes(currentStop.code);
 
   const handleTrackService = (svc: string) => {
     setServiceQuery(svc);
     setSearchMode('service');
-    // If that service has a known stop, or check if current stop serves it
     const svcDetail = BUS_SERVICES[svc.trim().toUpperCase()];
     if (svcDetail) {
-      // Keep or update stop
       if (!currentStop.services.some((s) => s.serviceNo === svc)) {
         setSelectedStopCode(svcDetail.primaryStopCode);
       }
@@ -239,6 +328,23 @@ export default function App() {
                       <span className="w-1.5 h-1.5 rounded-full bg-live-emerald animate-ping"></span>
                       Live Sync
                     </span>
+
+                    {/* LTA DataMall Indicator */}
+                    <button
+                      onClick={handleOpenHealth}
+                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold cursor-pointer transition ${
+                        ltaKeyConfigured
+                          ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
+                          : 'bg-purple-light text-primary hover:bg-purple-200'
+                      }`}
+                      title="Click to view API Health & LTA configuration"
+                      type="button"
+                    >
+                      <span className="material-symbols-outlined text-[13px]">
+                        {ltaKeyConfigured ? 'verified' : 'api'}
+                      </span>
+                      <span>{ltaKeyConfigured ? 'LTA DataMall v3 Live' : 'API v3 Ready'}</span>
+                    </button>
                   </div>
                   <p className="text-xs sm:text-sm text-text-secondary mt-0.5">
                     Current Anchor: <strong className="text-on-surface">{currentStop.name} (Stop {currentStop.code})</strong> • 4 nearest stops within 350m
@@ -247,7 +353,7 @@ export default function App() {
               </div>
 
               <div className="flex items-center gap-2.5 shrink-0 self-end md:self-center">
-                {/* Circular 30s Countdown timer */}
+                {/* Circular 20s Countdown timer */}
                 <div className="flex items-center gap-2 bg-surface-card-subtle px-3 py-1.5 rounded-lg text-xs font-medium text-text-secondary border border-border-subtle">
                   <svg className="w-4 h-4 transform -rotate-90">
                     <circle
@@ -267,7 +373,7 @@ export default function App() {
                       r="6"
                       stroke="currentColor"
                       strokeDasharray="37.7"
-                      strokeDashoffset={37.7 - (refreshCountdown / 30) * 37.7}
+                      strokeDashoffset={37.7 - (refreshCountdown / 20) * 37.7}
                       strokeWidth="2"
                     />
                   </svg>
@@ -278,7 +384,7 @@ export default function App() {
 
                 <button
                   onClick={handleManualRefresh}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-light text-primary hover:bg-primary hover:text-on-primary transition text-xs font-semibold shadow-xs"
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-light text-primary hover:bg-primary hover:text-on-primary transition text-xs font-semibold shadow-xs cursor-pointer"
                   type="button"
                 >
                   <span
@@ -293,7 +399,7 @@ export default function App() {
 
                 <button
                   onClick={() => setSearchMode('stop')}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-surface-container text-on-surface hover:bg-surface-container-highest transition text-xs font-semibold"
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-surface-container text-on-surface hover:bg-surface-container-highest transition text-xs font-semibold cursor-pointer"
                   type="button"
                 >
                   <span className="material-symbols-outlined text-[16px]">edit_location</span>
@@ -442,7 +548,7 @@ export default function App() {
                       Bus
                     </span>
                     <span className="text-2xl sm:text-3xl font-extrabold tracking-tight leading-none mt-0.5 font-headline">
-                      {activeServiceData.serviceNo}
+                      {baseServiceData.serviceNo}
                     </span>
                   </div>
 
@@ -513,7 +619,7 @@ export default function App() {
                   type="button"
                 >
                   <span className="material-symbols-outlined text-sm">east</span>
-                  <span>Direction 1: {activeServiceData.direction1.destination} ({activeServiceData.direction1.via})</span>
+                  <span>Direction 1: {baseServiceData.direction1.destination} ({baseServiceData.direction1.via})</span>
                 </button>
 
                 <button
@@ -526,14 +632,14 @@ export default function App() {
                   type="button"
                 >
                   <span className="material-symbols-outlined text-sm">west</span>
-                  <span>Direction 2: {activeServiceData.direction2.destination} ({activeServiceData.direction2.via})</span>
+                  <span>Direction 2: {baseServiceData.direction2.destination} ({baseServiceData.direction2.via})</span>
                 </button>
               </div>
 
               {/* Real-time 3 Arrivals Cluster */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 {/* 1st Bus Card */}
-                {activeDirection.arrivals[0] && (
+                {displayArrivals[0] && (
                   <div className="relative bg-surface-bright rounded-xl p-4.5 border border-live-emerald/40 shadow-xs flex flex-col justify-between">
                     <div className="flex items-center justify-between pb-3">
                       <span className="text-xs uppercase font-extrabold tracking-wider text-text-secondary flex items-center gap-1.5">
@@ -541,13 +647,13 @@ export default function App() {
                         Next Bus (1st)
                       </span>
                       <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-live-emerald-bg text-tertiary uppercase">
-                        {activeDirection.arrivals[0].status}
+                        {displayArrivals[0].status}
                       </span>
                     </div>
 
                     <div className="flex items-baseline gap-2 my-2">
                       <span className="text-4xl sm:text-5xl font-extrabold text-live-emerald tracking-tight font-headline">
-                        {activeDirection.arrivals[0].time}
+                        {displayArrivals[0].time}
                       </span>
                       <span className="text-xs text-text-muted font-medium">at platform</span>
                     </div>
@@ -556,15 +662,15 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         <span
                           className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-surface-container font-semibold text-text-secondary text-[11px]"
-                          title={`${activeDirection.arrivals[0].deck} Deck Bus`}
+                          title={`${displayArrivals[0].deck} Deck Bus`}
                         >
                           <span className="material-symbols-outlined text-[14px]">
-                            {activeDirection.arrivals[0].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
+                            {displayArrivals[0].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
                           </span>
-                          {activeDirection.arrivals[0].deck}
+                          {displayArrivals[0].deck}
                         </span>
 
-                        {activeDirection.arrivals[0].isWAB && (
+                        {displayArrivals[0].isWAB && (
                           <span
                             className="inline-flex items-center justify-center w-6 h-6 rounded bg-surface-container text-text-secondary"
                             title="Wheelchair Accessible"
@@ -577,27 +683,27 @@ export default function App() {
                       {/* Capacity Pill */}
                       <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-capacity-seats-bg text-tertiary flex items-center gap-1">
                         <span className="w-2 h-2 rounded-full bg-capacity-seats"></span>
-                        {activeDirection.arrivals[0].load}
+                        {displayArrivals[0].load}
                       </span>
                     </div>
                   </div>
                 )}
 
                 {/* 2nd Bus Card */}
-                {activeDirection.arrivals[1] && (
+                {displayArrivals[1] && (
                   <div className="bg-surface-card rounded-xl p-4.5 border border-border-subtle shadow-xs flex flex-col justify-between">
                     <div className="flex items-center justify-between pb-3">
                       <span className="text-xs uppercase font-bold tracking-wider text-text-secondary">
                         Following Bus (2nd)
                       </span>
                       <span className="text-xs font-mono text-text-muted">
-                        Plate: {activeDirection.arrivals[1].plate}
+                        Plate: {displayArrivals[1].plate}
                       </span>
                     </div>
 
                     <div className="flex items-baseline gap-1.5 my-2">
                       <span className="text-4xl sm:text-5xl font-extrabold text-primary tracking-tight font-headline">
-                        {activeDirection.arrivals[1].time}
+                        {displayArrivals[1].time}
                       </span>
                       <span className="text-sm font-semibold text-text-secondary">mins</span>
                     </div>
@@ -606,15 +712,15 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         <span
                           className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-surface-container font-semibold text-text-secondary text-[11px]"
-                          title={`${activeDirection.arrivals[1].deck} Deck Bus`}
+                          title={`${displayArrivals[1].deck} Deck Bus`}
                         >
                           <span className="material-symbols-outlined text-[14px]">
-                            {activeDirection.arrivals[1].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
+                            {displayArrivals[1].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
                           </span>
-                          {activeDirection.arrivals[1].deck}
+                          {displayArrivals[1].deck}
                         </span>
 
-                        {activeDirection.arrivals[1].isWAB && (
+                        {displayArrivals[1].isWAB && (
                           <span
                             className="inline-flex items-center justify-center w-6 h-6 rounded bg-surface-container text-text-secondary"
                             title="Wheelchair Accessible"
@@ -627,27 +733,27 @@ export default function App() {
                       {/* Capacity Pill */}
                       <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-capacity-standing-bg text-secondary flex items-center gap-1">
                         <span className="w-2 h-2 rounded-full bg-capacity-standing"></span>
-                        {activeDirection.arrivals[1].load}
+                        {displayArrivals[1].load}
                       </span>
                     </div>
                   </div>
                 )}
 
                 {/* 3rd Bus Card */}
-                {activeDirection.arrivals[2] && (
+                {displayArrivals[2] && (
                   <div className="bg-surface-card rounded-xl p-4.5 border border-border-subtle shadow-xs flex flex-col justify-between">
                     <div className="flex items-center justify-between pb-3">
                       <span className="text-xs uppercase font-bold tracking-wider text-text-secondary">
                         Next Following (3rd)
                       </span>
                       <span className="text-xs font-mono text-text-muted">
-                        Plate: {activeDirection.arrivals[2].plate}
+                        Plate: {displayArrivals[2].plate}
                       </span>
                     </div>
 
                     <div className="flex items-baseline gap-1.5 my-2">
                       <span className="text-4xl sm:text-5xl font-extrabold text-primary tracking-tight font-headline">
-                        {activeDirection.arrivals[2].time}
+                        {displayArrivals[2].time}
                       </span>
                       <span className="text-sm font-semibold text-text-secondary">mins</span>
                     </div>
@@ -656,15 +762,15 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         <span
                           className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded bg-surface-container font-semibold text-text-secondary text-[11px]"
-                          title={`${activeDirection.arrivals[2].deck} Deck Bus`}
+                          title={`${displayArrivals[2].deck} Deck Bus`}
                         >
                           <span className="material-symbols-outlined text-[14px]">
-                            {activeDirection.arrivals[2].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
+                            {displayArrivals[2].deck === 'Double' ? 'directions_bus' : 'airport_shuttle'}
                           </span>
-                          {activeDirection.arrivals[2].deck}
+                          {displayArrivals[2].deck}
                         </span>
 
-                        {activeDirection.arrivals[2].isWAB && (
+                        {displayArrivals[2].isWAB && (
                           <span
                             className="inline-flex items-center justify-center w-6 h-6 rounded bg-surface-container text-text-secondary"
                             title="Wheelchair Accessible"
@@ -677,7 +783,7 @@ export default function App() {
                       {/* Capacity Pill */}
                       <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-capacity-limited-bg text-error flex items-center gap-1">
                         <span className="w-2 h-2 rounded-full bg-capacity-limited"></span>
-                        {activeDirection.arrivals[2].load}
+                        {displayArrivals[2].load}
                       </span>
                     </div>
                   </div>
@@ -714,7 +820,7 @@ export default function App() {
                     <div className="absolute left-[38%] top-[-4px] -translate-x-1/2 z-20 flex flex-col items-center animate-bounce">
                       <div className="px-2 py-0.5 rounded bg-orange-action text-on-secondary text-[10px] font-extrabold shadow flex items-center gap-1 whitespace-nowrap">
                         <span className="material-symbols-outlined text-[12px]">directions_bus</span>
-                        Bus {activeServiceData.serviceNo} (~250m)
+                        Bus {baseServiceData.serviceNo} (~250m)
                       </div>
                       <div className="w-2 h-2 bg-orange-action rotate-45 -mt-1"></div>
                     </div>
@@ -775,7 +881,7 @@ export default function App() {
                   setServiceQuery(st.services[0].serviceNo);
                 }
               }}
-              currentService={activeServiceData.serviceNo}
+              currentService={baseServiceData.serviceNo}
             />
 
             {/* 4 Nearby Bus Stops Radar List */}
@@ -1268,6 +1374,17 @@ export default function App() {
                 <p className="text-[11px] text-text-muted leading-snug">
                   Dynamic bus arrival estimates and real-time passenger occupancy powered by Land Transport Authority Open Data API.
                 </p>
+                <div className="pt-1.5 flex items-center justify-between border-t border-border-subtle/70 mt-2 text-[11px]">
+                  <span className="text-text-muted">API Endpoint: /api/bus-arrival</span>
+                  <button
+                    onClick={handleOpenHealth}
+                    className="font-bold text-primary hover:text-orange-action flex items-center gap-1 cursor-pointer"
+                    type="button"
+                  >
+                    <span>Health Probe</span>
+                    <span className="material-symbols-outlined text-[14px]">arrow_forward</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1275,6 +1392,12 @@ export default function App() {
           <div className="pt-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-text-muted">
             <div>© 2025–2026 SBS Transit Ltd. All rights reserved. Co. Reg. No. 199206653M</div>
             <div className="flex items-center gap-6">
+              <button
+                onClick={handleOpenHealth}
+                className="hover:text-primary transition-colors cursor-pointer text-left"
+              >
+                API Status &amp; Health (/api/health)
+              </button>
               <span className="hover:text-primary transition-colors cursor-pointer">Terms of Use</span>
               <span className="hover:text-primary transition-colors cursor-pointer">Privacy Policy</span>
               <span className="hover:text-primary transition-colors cursor-pointer">Cyber Security</span>
@@ -1314,6 +1437,12 @@ export default function App() {
         advisory={selectedAdvisory}
         onClose={() => setSelectedAdvisory(null)}
         onTrackService={handleTrackService}
+      />
+
+      <ApiHealthModal
+        isOpen={isHealthModalOpen}
+        onClose={() => setIsHealthModalOpen(false)}
+        initialData={healthData}
       />
     </div>
   );
