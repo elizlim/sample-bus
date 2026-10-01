@@ -1,0 +1,7 @@
+{
+  "name": "SBS Transit NextBus - Real-Time Bus Arrivals",
+  "description": "Real-time SBS Transit bus arrival tracker, GPS nearby stop radar, route trajectories, and commuter advisories powered by LTA DataMall.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
